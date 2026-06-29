@@ -1,0 +1,14 @@
+# IDE / Editor
+.idea/
+*.iml
+.vscode/
+
+# OS generated
+.DS_Store
+**/.DS_Store
+Thumbs.db
+
+# Temporary files
+*.swp
+*.swo
+*~

@@ -1,0 +1,292 @@
+name: PR Check
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    name: PR Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      # ============================================================
+      # Step 0: Checkout
+      # ============================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ============================================================
+      # Step 1: 变更隔离检查 (Directory Isolation Check)
+      # ============================================================
+      - name: Directory Isolation Check
+        id: isolation
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+
+          # ----------------------------------------------------------
+          # 工具函数：判断文件是否属于 IDE/OS 自动生成的忽略文件
+          # ----------------------------------------------------------
+          is_ignored() {
+            local file="$1"
+            [[ "$file" == .idea ]]       && return 0
+            [[ "$file" == .idea/* ]]     && return 0
+            [[ "$file" == *.iml ]]       && return 0
+            [[ "$file" == .DS_Store ]]   && return 0
+            [[ "$file" == */.DS_Store ]] && return 0
+            [[ "$file" == .vscode ]]     && return 0
+            [[ "$file" == .vscode/* ]]   && return 0
+            [[ "$file" == *.swp ]]       && return 0
+            [[ "$file" == *.swo ]]       && return 0
+            [[ "$file" == *~ ]]          && return 0
+            [[ "$file" == Thumbs.db ]]   && return 0
+            [[ "$file" == */Thumbs.db ]] && return 0
+            return 1
+          }
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          echo "::group::📋 当前 PR 变更文件列表（原始）"
+          ALL_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | sort -u)
+          if [ -z "$ALL_FILES" ]; then
+            echo "（无文件变更）"
+          else
+            echo "$ALL_FILES"
+          fi
+          echo "::endgroup::"
+
+          # ----------------------------------------------------------
+          # 过滤：忽略 IDE/OS 生成文件
+          # ----------------------------------------------------------
+          echo "::group::🔍 过滤 IDE / OS 自动生成文件"
+          FILTERED_FILES=()
+          while IFS= read -r file; do
+            if [ -z "$file" ]; then continue; fi
+            if is_ignored "$file"; then
+              echo "  ⏭️  [IGNORED] $file"
+            else
+              FILTERED_FILES+=("$file")
+              echo "  ✅ [KEPT]    $file"
+            fi
+          done <<< "$ALL_FILES"
+          echo "::endgroup::"
+
+          # ----------------------------------------------------------
+          # 如果没有有效文件变更，直接跳过
+          # ----------------------------------------------------------
+          if [ ${#FILTERED_FILES[@]} -eq 0 ]; then
+            echo "::notice:: 没有需要校验的有效文件变更（仅包含 IDE/配置文件）。跳过隔离检查。"
+            echo "student_dir=" >> "$GITHUB_OUTPUT"
+            echo "check_passed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ----------------------------------------------------------
+          # 分析：提取每个文件所属的顶层目录
+          # ----------------------------------------------------------
+          echo "::group::📂 目录归属分析"
+          declare -A TOP_DIRS
+          ROOT_FILES=()
+
+          for file in "${FILTERED_FILES[@]}"; do
+            TOP_DIR="${file%%/*}"
+            if [ "$TOP_DIR" = "$file" ]; then
+              ROOT_FILES+=("$file")
+              echo "  🔴 [ROOT]   $file"
+            else
+              TOP_DIRS["$TOP_DIR"]=1
+              echo "  🟢 [DIR]    $file  →  $TOP_DIR/"
+            fi
+          done
+          echo "::endgroup::"
+
+          # ----------------------------------------------------------
+          # 校验规则
+          # ----------------------------------------------------------
+          FAIL=false
+          FAIL_REASON=""
+
+          # 规则 1：不允许修改仓库根目录文件
+          if [ ${#ROOT_FILES[@]} -gt 0 ]; then
+            FAIL=true
+            FAIL_REASON+="🚫 PR 中包含了仓库根目录文件的修改：\`${ROOT_FILES[*]}\`。\n\n> 请不要直接修改根目录的基础配置文件（如 .gitignore、.editorconfig 等）。如有需要，请联系管理员。"
+            echo "::error:: 根目录文件被修改: ${ROOT_FILES[*]}"
+          fi
+
+          # 规则 2：每次 PR 只能修改一个学生目录
+          if [ ${#TOP_DIRS[@]} -gt 1 ]; then
+            FAIL=true
+            DIR_LIST=$(printf '、\`%s\`' "${!TOP_DIRS[@]}" | sed 's/^、//')
+            if [ -n "$FAIL_REASON" ]; then
+              FAIL_REASON+="\n\n"
+            fi
+            FAIL_REASON+="🚫 PR 同时修改了多个目录：${DIR_LIST}。\n\n> 请确保每次 PR 只修改你自己的学生目录。"
+            echo "::error:: 多个学生目录被修改: ${!TOP_DIRS[*]}"
+          fi
+
+          # 记录当前学生目录
+          STUDENT_DIR=""
+          if [ ${#TOP_DIRS[@]} -eq 1 ]; then
+            STUDENT_DIR="${!TOP_DIRS[@]}"
+            echo "::notice:: ✅ 通过隔离检查，当前学生目录：${STUDENT_DIR}"
+          fi
+
+          # 输出 student_dir 给后续步骤使用
+          echo "student_dir=${STUDENT_DIR}" >> "$GITHUB_OUTPUT"
+
+          # 将失败原因写入文件，供 Bot 留言步骤读取
+          # 使用 printf '%b' 将 \n 转义符解释为真正的换行
+          if [ -n "$FAIL_REASON" ]; then
+            printf '%b\n' "$FAIL_REASON" > /tmp/fail_reason.txt
+          fi
+
+          if [ "$FAIL" = true ]; then
+            echo ""
+            echo "============================================"
+            echo "❌ 目录隔离检查失败 (Directory Isolation FAIL)"
+            echo "============================================"
+            exit 1
+          fi
+
+          echo ""
+          echo "============================================"
+          echo "✅ 目录隔离检查通过 (Directory Isolation PASS)"
+          echo "   学生目录: ${STUDENT_DIR}"
+          echo "============================================"
+
+      # ============================================================
+      # Step 2: 基础 Lint / 格式化检查（预留占位）
+      # ============================================================
+      - name: Lint Check
+        id: lint
+        if: success() && steps.isolation.outputs.student_dir != ''
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+
+          STUDENT_DIR="${{ steps.isolation.outputs.student_dir }}"
+
+          echo "::group::📝 Lint 检查 — 学生目录: ${STUDENT_DIR}"
+          echo ""
+          echo "============================================"
+          echo "  正在校验目录: ${STUDENT_DIR}"
+          echo "============================================"
+          echo ""
+
+          # ========================================================
+          # 检查 1: 文档文件
+          # ========================================================
+          echo "--- [1/3] 检查文档文件 ---"
+          if compgen -G "${STUDENT_DIR}/README*" > /dev/null || \
+             compgen -G "${STUDENT_DIR}/*.md"   > /dev/null; then
+            echo "✅ 发现 README / Markdown 文档文件"
+          else
+            echo "⚠️  建议: 在目录中添加 README.md 说明文件"
+          fi
+
+          # ========================================================
+          # 检查 2: 行尾空格
+          # ========================================================
+          echo ""
+          echo "--- [2/3] 检查行尾空格 ---"
+          TRAILING=$(find "${STUDENT_DIR}" -type f \
+            -not -path '*/.git/*' \
+            -exec grep -l ' $' {} \; 2>/dev/null || true)
+          if [ -n "$TRAILING" ]; then
+            echo "⚠️  以下文件包含行尾多余空格:"
+            echo "$TRAILING"
+          else
+            echo "✅ 未发现行尾空格问题"
+          fi
+
+          # ========================================================
+          # 检查 3: 文件结尾换行
+          # ========================================================
+          echo ""
+          echo "--- [3/3] 检查文件结尾换行符 ---"
+          NO_NEWLINE=$(find "${STUDENT_DIR}" -type f \
+            -not -path '*/.git/*' \
+            -not -name '*.png' \
+            -not -name '*.jpg' \
+            -not -name '*.jpeg' \
+            -not -name '*.gif' \
+            -not -name '*.ico' \
+            -not -name '*.bin' \
+            -exec bash -c 'test "$(tail -c 1 "$1")" != "" && echo "$1"' _ {} \; 2>/dev/null || true)
+          if [ -n "$NO_NEWLINE" ]; then
+            echo "⚠️  以下文件缺少结尾换行符:"
+            echo "$NO_NEWLINE"
+          else
+            echo "✅ 文件结尾换行符正常"
+          fi
+
+          # ========================================================
+          # 预留接入点: 具体语言 Lint 工具
+          # 说明见文件末尾的 "后续接入指南"
+          # ========================================================
+          echo ""
+          echo "--- 特定语言 Lint（预留，当前跳过）---"
+          echo "ℹ️  未配置具体语言 Lint 工具。"
+          echo "   如需接入 Python Ruff / Kotlin ktlint / JS ESLint 等，"
+          echo "   请参考本 workflow 文件末尾的接入指南。"
+          echo ""
+
+          echo "::endgroup::"
+
+          echo ""
+          echo "============================================"
+          echo "✅ Lint 检查完成"
+          echo "============================================"
+
+      # ============================================================
+      # Step 3: 失败时自动留言（GitHub Bot Comment）
+      # ============================================================
+      - name: Post Failure Comment on PR
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const lintFailed = '${{ steps.lint.outcome }}' === 'failure';
+
+            // 从文件中读取失败原因（由 isolation 步骤写入）
+            let failReason = '';
+            try {
+              failReason = fs.readFileSync('/tmp/fail_reason.txt', 'utf8').trim();
+            } catch (e) {
+              // 文件不存在 = 非 isolation 步骤失败
+            }
+
+            let body = '## ❌ PR 校验失败\n\n';
+
+            if (failReason) {
+              body += failReason + '\n\n';
+            }
+
+            if (lintFailed) {
+              body += '⚠️ **Lint 检查未通过。** 请查看上方 Checks 标签页的日志详情，修复后重新提交。\n\n';
+            }
+
+            if (!failReason && !lintFailed) {
+              body += '⚠️ 校验过程中出现未知错误。请查看 Checks 标签页日志。\n\n';
+            }
+
+            body += '---\n';
+            body += '> 🤖 这是由 CI 流水线自动生成的校验反馈。请根据提示修改 PR 后重新推送。\n';
+            body += '> 如有疑问，请联系项目管理员。\n';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
